@@ -227,6 +227,8 @@ class VideoCombine:
                     else:
                         raise
 
+        print(f">>>>>>>>> file = {file}, file_path = {file_path}")
+        
         previews = [
             {
                 "filename": file,
