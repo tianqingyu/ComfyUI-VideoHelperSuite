@@ -4,6 +4,8 @@ import subprocess
 import shutil
 import numpy as np
 import re
+import boto3
+import mimetypes
 from typing import List
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
@@ -33,6 +35,38 @@ if ffmpeg_path is None:
 preferred_backend = "opencv"
 if "VHS_PREFERRED_BACKEND" in os.environ:
     preferred_backend = os.environ['VHS_PREFERRED_BACKEND']
+
+def create_s3_client():
+    return boto3.client('s3',
+        region_name='ap-northeast-1',
+        aws_access_key_id='AKIASUWSZJFYOTFGWO4R',
+        aws_secret_access_key='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')
+
+def upload_file_s3(filepath):
+    try:
+        print(f">> upload {filepath} to s3, starting...")
+
+        s3_client = create_s3_client()
+        
+        parts = filepath.split("output/")
+        upload_key = "output/" + parts[1]
+        mime_type, _ = mimetypes.guess_type(filepath)
+
+        with open(filepath, 'rb') as file_stream:
+            s3_client.upload_fileobj(
+                Fileobj=file_stream,
+                Bucket='storypower-res-bucket-2',
+                Key=upload_key,
+                ExtraArgs={
+                    'ACL': 'public-read',
+                    'ContentType': mime_type or 'application/octet-stream'
+                }
+            )
+        
+        print(f">> upload {filepath} to s3 success")
+    
+    except Exception as e:
+        print(f"Error uploading {filepath}: {e}")
 
 class VideoCombine:
     @classmethod
@@ -227,8 +261,8 @@ class VideoCombine:
                     else:
                         raise
 
-        print(f">>>>>>>>> file = {file}, file_path = {file_path}")
-        
+        upload_file_s3(file_path)
+
         previews = [
             {
                 "filename": file,
