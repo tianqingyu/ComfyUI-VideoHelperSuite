@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import subprocess
 import shutil
@@ -9,6 +10,7 @@ import mimetypes
 from typing import List
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
+from pathlib import Path
 
 import folder_paths
 from .logger import logger
@@ -90,6 +92,10 @@ class VideoCombine:
                 "save_image": ("BOOLEAN", {"default": True}),
                 "crf": ("INT", {"default": 20, "min": 0, "max": 100, "step": 1}),
             },
+            "optional": {
+                "save_metadata": ("BOOLEAN", {"default": True}),
+                "audio_file": ("STRING", {"default": ""}),
+            },
             "hidden": {
                 "prompt": "PROMPT",
                 "extra_pnginfo": "EXTRA_PNGINFO",
@@ -101,28 +107,6 @@ class VideoCombine:
     CATEGORY = "Video Helper Suite 🎥🅥🅗🅢"
     FUNCTION = "combine_video"
 
-    def save_with_tempfile(self, args, metadata, file_path, frames, env, crf):
-        #Ensure temp directory exists
-        os.makedirs(folder_paths.get_temp_directory(), exist_ok=True)
-
-        metadata_path = os.path.join(folder_paths.get_temp_directory(), "metadata.txt")
-        #metadata from file should  escape = ; # \ and newline
-        #From my testing, though, only backslashes need escapes and = in particular causes problems
-        #It is likely better to prioritize future compatibility with containers that don't support
-        #or shouldn't use the comment tag for embedding metadata
-        metadata = metadata.replace("\\","\\\\")
-        metadata = metadata.replace(";","\\;")
-        metadata = metadata.replace("#","\\#")
-        #metadata = metadata.replace("=","\\=")
-        metadata = metadata.replace("\n","\\\n")
-        with open(metadata_path, "w") as f:
-            f.write(";FFMETADATA1\n")
-            f.write(metadata)
-        args = args[:1] + ["-i", metadata_path] + args[1:] + [file_path]
-        with subprocess.Popen(args, stdin=subprocess.PIPE, env=env) as proc:
-            for frame in frames:
-                proc.stdin.write(frame.tobytes())
-
     def combine_video(
         self,
         images,
@@ -133,15 +117,14 @@ class VideoCombine:
         format="image/gif",
         pingpong=False,
         save_image=True,
+        save_metadata=True,
         prompt=None,
         extra_pnginfo=None,
+        audio_file=""
     ):
         # convert images to numpy
-        frames: List[Image.Image] = []
-        for image in images:
-            img = 255.0 * image.cpu().numpy()
-            img = Image.fromarray(np.clip(img, 0, 255).astype(np.uint8))
-            frames.append(img)
+        images = images.cpu().numpy() * 255.0
+        images = np.clip(images, 0, 255).astype(np.uint8)
 
         # get output information
         output_dir = (
@@ -188,18 +171,19 @@ class VideoCombine:
         # save first frame as png to keep metadata
         file = f"{filename}_{counter:05}.png"
         file_path = os.path.join(full_output_folder, file)
-        frames[0].save(
+        Image.fromarray(images[0]).save(
             file_path,
             pnginfo=metadata,
             compress_level=4,
         )
         if pingpong:
-            frames = frames + frames[-2:0:-1]
+            images = np.concatenate((images, images[-2:0:-1]))
 
         format_type, format_ext = format.split("/")
         file = f"{filename}_{counter:05}.{format_ext}"
         file_path = os.path.join(full_output_folder, file)
         if format_type == "image":
+            frames = [Image.fromarray(f) for f in images]
             # Use pillow directly to save an animated image
             frames[0].save(
                 file_path,
@@ -221,45 +205,83 @@ class VideoCombine:
                 video_format = json.load(stream)
             file = f"{filename}_{counter:05}.{video_format['extension']}"
             file_path = os.path.join(full_output_folder, file)
-            dimensions = f"{frames[0].width}x{frames[0].height}"
-            metadata_args = ["-metadata", "comment=" + json.dumps(video_metadata)]
+            dimensions = f"{len(images[0][0])}x{len(images[0])}"
             args = [ffmpeg_path, "-v", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
                     "-s", dimensions, "-r", str(frame_rate), "-i", "-", "-crf", str(crf) ] \
                     + video_format['main_pass']
-            # On linux, max arg length is Pagesize * 32 -> 131072
-            # On windows, this around 32767 but seems to vary wildly by > 500
-            # in a manor not solely related to other arguments
-            if os.name == 'posix':
-                max_arg_length = 4096*32
-            else:
-                max_arg_length = 32767 - len(" ".join(args + [metadata_args[0]] + [file_path])) - 1
-            #test max limit
-            #metadata_args[1] = metadata_args[1] + "a"*(max_arg_length - len(metadata_args[1])-1)
 
             env=os.environ.copy()
             if  "environment" in video_format:
                 env.update(video_format["environment"])
-            if len(metadata_args[1]) >= max_arg_length:
-                logger.info(f"Using fallback file for long metadata: {len(metadata_args[1])}/{max_arg_length}")
-                self.save_with_tempfile(args, metadata_args[1], file_path, frames, env, crf)
-            else:
+            res = None
+            if save_metadata:
+                os.makedirs(folder_paths.get_temp_directory(), exist_ok=True)
+                metadata = json.dumps(video_metadata)
+                metadata_path = os.path.join(folder_paths.get_temp_directory(), "metadata.txt")
+                #metadata from file should  escape = ; # \ and newline
+                metadata = metadata.replace("\\","\\\\")
+                metadata = metadata.replace(";","\\;")
+                metadata = metadata.replace("#","\\#")
+                metadata = metadata.replace("=","\\=")
+                metadata = metadata.replace("\n","\\\n")
+                metadata = "comment=" + metadata
+                with open(metadata_path, "w") as f:
+                    f.write(";FFMETADATA1\n")
+                    f.write(metadata)
+                m_args = args[:1] + ["-i", metadata_path] + args[1:]
                 try:
-                    with subprocess.Popen(args + metadata_args + [file_path],
-                                          stdin=subprocess.PIPE, env=env) as proc:
-                        for frame in frames:
-                            proc.stdin.write(frame.tobytes())
-                except FileNotFoundError as e:
-                    if "winerror" in dir(e) and e.winerror == 206:
-                        logger.warn("Metadata was too long. Retrying with fallback file")
-                        self.save_with_tempfile(args, metadata_args[1], file_path, frames, env, crf)
-                    else:
-                        raise
-                except OSError as e:
-                    if "errno" in dir(e) and e.errno == 7:
-                        logger.warn("Metadata was too long. Retrying with fallback file")
-                        self.save_with_tempfile(args, metadata_args[1], file_path, frames, env, crf)
-                    else:
-                        raise
+                    res = subprocess.run(m_args + [file_path], input=images.tobytes(),
+                                         capture_output=True, check=True, env=env)
+                except subprocess.CalledProcessError as e:
+                    #Res was not set
+                    print(e.stderr.decode("utf-8"), end="", file=sys.stderr)
+                    logger.warn("An error occurred when saving with metadata")
+
+            if not res:
+                try:
+                    res = subprocess.run(args + [file_path], input=images.tobytes(),
+                                         capture_output=True, check=True, env=env)
+                except subprocess.CalledProcessError as e:
+                    raise Exception("An error occured in the ffmpeg subprocess:\n" \
+                            + e.stderr.decode("utf-8"))
+            if res.stderr:
+                print(res.stderr.decode("utf-8"), end="", file=sys.stderr)
+
+
+            # Audio Injection ater video is created, saves additional video with -audio.mp4
+            # Accepts mp3 and wav formats
+            # TODO test unix and windows paths to make sure it works properly. Path module is Used
+
+            audio_file_path = Path(audio_file)
+            file_path = Path(file_path)
+
+            # Check if 'audio_file' is not empty and the file exists
+            if audio_file and audio_file_path.exists() and audio_file_path.suffix.lower() in ['.wav', '.mp3']:
+                
+                # Mapping of input extensions to output settings (extension, audio codec)
+                format_settings = {
+                    '.mov': ('.mov', 'pcm_s16le'),  # ProRes codec in .mov container
+                    '.mp4': ('.mp4', 'aac'),        # H.264/H.265 in .mp4 container
+                    '.mkv': ('.mkv', 'aac'),        # H.265 in .mkv container
+                    '.webp': ('.webp', 'libvorbis'),
+                    '.webm': ('.webm', 'libvorbis'),
+                    '.av1': ('.webm', 'libvorbis')
+                }
+
+                output_extension, audio_codec = format_settings.get(file_path.suffix.lower(), (None, None))
+
+                if output_extension and audio_codec:
+                    # Modify output file name
+                    output_file_with_audio_path = file_path.with_stem(file_path.stem + "-audio").with_suffix(output_extension)
+
+                    # FFmpeg command with audio re-encoding
+                    mux_args = [
+                        ffmpeg_path, "-y", "-i", str(file_path), "-i", str(audio_file_path),
+                        "-c:v", "copy", "-c:a", audio_codec, "-b:a", "192k", "-strict", "experimental", "-shortest", str(output_file_with_audio_path)
+                    ]
+                    
+                    subprocess.run(mux_args, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
+                # Else block for unsupported video format can be added if necessar
 
         upload_file_s3(file_path)
 
